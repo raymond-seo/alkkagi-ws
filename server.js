@@ -116,7 +116,7 @@ function decryptTossField(b64) {
 
 // === 결과 반영(서버 권위) ===
 // body: { win: boolean }
-app.post('/api/reportResult', express.json(), async (req, res) => {
+app.post('/api/reportResult', async (req, res) => {
   if (!req.session?.user) return res.status(401).json({ ok:false, error:'NO_SESSION' });
   const { id, name } = req.session.user;
   const win = !!req.body.win;
@@ -208,8 +208,24 @@ const BOARD_H = 640;
 const STONE_RADIUS = 18;
 const FRICTION = 0.985;
 
+// --- 로비/방 목록용 유틸 ---
+const clients = new Map(); // socket.id -> { name }
+const roomPublic = (r) => ({
+  id: r.id,
+  name: r.name,
+  slots: r.players.length,
+  status: r.gameState ? 'playing' : 'waiting',
+  players: r.players.map(p => ({ id: p.id, name: p.name, ready: !!p.ready })),
+});
+const broadcastRooms = () => {
+  const list = Object.values(gameRooms).map(roomPublic);
+  io.emit('roomsUpdate', list);
+};
+
+
+
 // 전역 상태(메모리) — 단일 인스턴스 기준 데모
-const gameRooms = {};
+const gameRooms = {}; // roomId -> { id, name, players:[{id,name,ready}], gameState, simulationInterval }
 
 // ========================================================
 // 2. 게임 로직
@@ -258,6 +274,7 @@ function startGame(roomId) {
       playerIndex: idx
     });
   });
+  broadcastRooms();
 }
 
 function runSimulation(roomId) {
@@ -340,6 +357,7 @@ function runSimulation(roomId) {
           : room.gameState.players.findIndex(p => p.isCat);
         io.to(roomId).emit('gameOver', winnerIndex);
         delete gameRooms[roomId];
+        broadcastRooms();
       } else {
         room.gameState.turn = 1 - room.gameState.turn;
         io.to(roomId).emit('turnChange', room.gameState);
@@ -354,28 +372,47 @@ function runSimulation(roomId) {
 io.on('connection', (socket) => {
   console.log('[연결]', socket.id);
 
-  socket.on('createRoom', () => {
+  socket.on('setName', (name) => {
+    const clean = (name || '').toString().trim().slice(0, 20) || '플레이어';
+    clients.set(socket.id, { name: clean });
+  });
+
+  socket.on('listRooms', () => {
+    const list = Object.values(gameRooms).map(roomPublic);
+    socket.emit('rooms', list);
+  });
+
+  socket.on('createRoom', (payload = {}) => {
+    const roomName = (payload.name || '').toString().trim().slice(0, 20) || '무제 방';
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
+
     socket.join(roomId);
+    const myName = clients.get(socket.id)?.name || '플레이어';
     gameRooms[roomId] = {
       id: roomId,
-      players: [{ id: socket.id, ready: false }],
+      name: roomName,
+      players: [{ id: socket.id, name: myName, ready: false }],
       gameState: null,
       simulationInterval: null
     };
-    socket.emit('roomCreated', roomId);
-    io.to(roomId).emit('updateRoom', gameRooms[roomId]);
+    // 방 생성자에게 방 정보, 전체에 목록
+    socket.emit('roomCreated', roomPublic(gameRooms[roomId]));
+    io.to(roomId).emit('updateRoom', roomPublic(gameRooms[roomId]));
+    broadcastRooms();
   });
 
   socket.on('joinRoom', (roomId) => {
     const room = gameRooms[roomId];
-    if (room && room.players.length < 2) {
-      socket.join(roomId);
-      room.players.push({ id: socket.id, ready: false });
-      io.to(roomId).emit('updateRoom', room);
-    } else {
-      socket.emit('joinError', room ? '방이 꽉 찼습니다.' : '존재하지 않는 방입니다.');
-    }
+    if (!room) return socket.emit('joinError', '존재하지 않는 방입니다.');
+    if (room.players.length >= 2) return socket.emit('joinError', '방이 꽉 찼습니다.');
+    if (room.gameState) return socket.emit('joinError', '이미 게임 중입니다.');
+
+    socket.join(roomId);
+    const myName = clients.get(socket.id)?.name || '플레이어';
+    room.players.push({ id: socket.id, name: myName, ready: false });
+
+    io.to(roomId).emit('updateRoom', roomPublic(room));
+    broadcastRooms();
   });
 
   socket.on('playerReady', (roomId) => {
@@ -383,12 +420,29 @@ io.on('connection', (socket) => {
     if (!room) return;
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
+
     player.ready = !player.ready;
-    io.to(roomId).emit('updateRoom', room);
+    io.to(roomId).emit('updateRoom', roomPublic(room));
+    broadcastRooms();
 
     const allReady = room.players.length === 2 && room.players.every(p => p.ready);
     if (allReady) startGame(roomId);
   });
+
+  socket.on('leaveRoom', (roomId) => {
+    const room = gameRooms[roomId];
+    if (!room) return;
+    room.players = room.players.filter(p => p.id !== socket.id);
+    socket.leave(roomId);
+
+    if (room.players.length === 0) {
+      delete gameRooms[roomId];
+    } else {
+      io.to(roomId).emit('updateRoom', roomPublic(room));
+    }
+    broadcastRooms();
+  });
+
 
   socket.on('shoot', ({ roomId, stoneId, force }) => {
     const room = gameRooms[roomId];
@@ -407,7 +461,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log('[끊김]', socket.id);
+    clients.delete(socket.id);
     for (const roomId in gameRooms) {
       const room = gameRooms[roomId];
       const idx = room.players.findIndex(p => p.id === socket.id);
@@ -417,10 +471,10 @@ io.on('connection', (socket) => {
           io.to(room.players[opp].id).emit('gameOver', opp);
         }
         delete gameRooms[roomId];
-        console.log(`[방 삭제] ${roomId}`);
         break;
       }
     }
+    broadcastRooms();
   });
 });
 
