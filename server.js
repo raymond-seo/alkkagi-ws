@@ -15,6 +15,17 @@ const cookieSession = require('cookie-session');
 const axios = require('axios');
 const crypto = require('crypto');
 
+// === Firestore ===
+const admin = require('firebase-admin');
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId:  process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey:  (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  }),
+});
+const db = admin.firestore();
+
 app.set('trust proxy', 1);
 
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || 'https://mellow-parfait-132923.netlify.app';
@@ -30,12 +41,19 @@ app.use(cookieSession({
   maxAge: 1000 * 60 * 60 * 24 * 7,
 }));
 
-// === 내 정보 ===
-app.get('/api/me', (req, res) => {
-  if (req.session?.user) {
-    return res.json(req.session.user); // { id, name }
+// === 내 정보 (세션 + Firestore) ===
+app.get('/api/me', async (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ ok:false, error:'NO_SESSION' });
+  const { id, name } = req.session.user; // toss/exchange에서 저장한 필드
+
+  try {
+    const snap = await db.collection('users').doc(id).get();
+    const base = snap.exists ? snap.data() : { rating:1000, wins:0, losses:0 };
+    return res.json({ ok:true, id, name, ...base });
+  } catch (e) {
+    console.error('/api/me error', e);
+    return res.status(500).json({ ok:false });
   }
-  return res.status(401).json({ error: 'NO_SESSION' });
 });
 
 // === 앱인토스: 인가코드 교환 → 이름 복호화 → 세션 저장 ===
@@ -95,21 +113,35 @@ function decryptTossField(b64) {
   return out.toString('utf8');
 }
 
-// === 추가: 결과 반영(서버 권위) ===
+
+// === 결과 반영(서버 권위) ===
 // body: { win: boolean }
-app.post('/api/reportResult', (req, res) => {
-  if (!req.session?.user) return res.status(401).json({ ok:false });
-  const id = req.session.user.id; // 세션의 id 사용
-  if (!global.__USERS__) global.__USERS__ = new Map();
-  const u = global.__USERS__.get(id) || { name:req.session.user.name, rating:1000, wins:0, losses:0 };
+app.post('/api/reportResult', express.json(), async (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ ok:false, error:'NO_SESSION' });
+  const { id, name } = req.session.user;
+  const win = !!req.body.win;
 
-  const win = !!req.body.win; // 전역 express.json()로 파싱됨
-  if (win) { u.wins++; u.rating += 15; }
-  else     { u.losses++; u.rating = Math.max(0, u.rating - 7); }
+  try {
+    const ref = db.collection('users').doc(id);
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const cur  = snap.exists ? snap.data() : { rating:1000, wins:0, losses:0, name };
+      const next = {
+        name,
+        wins:   (cur.wins||0)   + (win ? 1 : 0),
+        losses: (cur.losses||0) + (win ? 0 : 1),
+        rating: Math.max(0, (cur.rating||1000) + (win ? 15 : -7)),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      tx.set(ref, next, { merge: true });
+      return next;
+    });
 
-  u.updatedAt = Date.now();
-  global.__USERS__.set(id, u);
-  res.json({ ok:true, rating:u.rating, wins:u.wins, losses:u.losses });
+    res.json({ ok:true, rating:result.rating, wins:result.wins, losses:result.losses });
+  } catch (e) {
+    console.error('/api/reportResult error', e);
+    res.status(500).json({ ok:false });
+  }
 });
 
 // === 추가: 리더보드/등급(상대평가) ===
@@ -121,23 +153,43 @@ function tierByPercentile(pct){ // 0~100 (작을수록 상위)
   if (pct <= 65) return 'SILVER';
   return 'BRONZE';
 }
-app.get('/api/leaderboard/me', (req, res) => {
-  if (!req.session?.user) return res.status(401).json({ ok:false });
-  if (!global.__USERS__) global.__USERS__ = new Map();
 
-  const id = req.session.user.id;
+app.get('/api/leaderboard/me', async (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ ok:false, error:'NO_SESSION' });
+  const { id } = req.session.user;
 
-  const users = Array.from(global.__USERS__.entries())
-    .map(([uid, u]) => ({ id: uid, ...u }))
-    .sort((a,b)=> b.rating - a.rating);
+  try {
+    // 내 점수
+    const meDoc = await db.collection('users').doc(id).get();
+    const me = meDoc.exists ? meDoc.data() : { rating:1000, wins:0, losses:0 };
 
-  const total = users.length || 1;
-  const meIdx = users.findIndex(u => u.id === id);
-  const rank = (meIdx === -1 ? total : meIdx + 1);
-  const percentile = Math.round((rank - 1) / total * 100); // 0% = 1등
-  const tier = tierByPercentile(percentile);
+    // 총 유저 수 (Aggregation)
+    const totalAgg = await db.collection('users').count().get();
+    const total = totalAgg.data().count || 1;
 
-  res.json({ ok:true, rank, total, percentile, tier, snapshot: users.slice(0,50) });
+    // 나보다 점수 높은 사람 수 → 랭크 = higher + 1
+    const higherAgg = await db.collection('users')
+      .where('rating', '>', me.rating || 1000)
+      .count()
+      .get();
+    const higher = higherAgg.data().count || 0;
+    const rank = higher + 1;
+
+    const percentile = Math.round((rank - 1) / total * 100); // 0% = 1등
+    const tier = tierByPercentile(percentile);
+
+    // 상위 50명 스냅샷
+    const topSnap = await db.collection('users')
+      .orderBy('rating', 'desc')
+      .limit(50)
+      .get();
+    const snapshot = topSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    res.json({ ok:true, rank, total, percentile, tier, snapshot });
+  } catch (e) {
+    console.error('/api/leaderboard/me error', e);
+    res.status(500).json({ ok:false });
+  }
 });
 
 
