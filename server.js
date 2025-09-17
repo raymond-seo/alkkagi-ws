@@ -22,8 +22,9 @@ const io = new Server(server, {
 });
 
 // 게임 상수
-const CANVAS_SIZE = 500; // 서버/클라이언트 동일 상수
-const STONE_RADIUS = CANVAS_SIZE / 20;
+const BOARD_W = 360;
+const BOARD_H = 640;
+const STONE_RADIUS = 18;
 const FRICTION = 0.985;
 
 // 전역 상태(메모리) — 단일 인스턴스 기준 데모
@@ -47,28 +48,27 @@ function startGame(roomId) {
     ]
   };
 
-  // 초기 말 배치(결정론적)
-  let stoneId = 0;
-  for (let i = 0; i < 5; i++) {
-    room.gameState.stones.push({
-      id: stoneId++,
-      ownerIndex: 0,
-      isCat: true,
-      x: CANVAS_SIZE / 4,
-      y: (CANVAS_SIZE / 6) * (i + 1),
-      vx: 0, vy: 0,
-      radius: STONE_RADIUS
-    });
-    room.gameState.stones.push({
-      id: stoneId++,
-      ownerIndex: 1,
-      isCat: false,
-      x: (CANVAS_SIZE * 3) / 4,
-      y: (CANVAS_SIZE / 6) * (i + 1),
-      vx: 0, vy: 0,
-      radius: STONE_RADIUS
-    });
-  }
+   // 초기 말 배치(클라와 동일 레이아웃)
+   let stoneId = 0;
+   const cols = 3, gap = 52, offY = 120;
+   // 고양이(상단)
+   for (let i = 0; i < 5; i++) {
+     const x = BOARD_W * 0.5 + (i % cols - 1) * gap;
+     const y = offY + Math.floor(i / cols) * gap;
+     room.gameState.stones.push({
+       id: stoneId++, ownerIndex: 0, isCat: true,
+       x, y, vx: 0, vy: 0, radius: STONE_RADIUS
+     });
+   }
+   // 강아지(하단)
+   for (let i = 0; i < 5; i++) {
+     const x = BOARD_W * 0.5 + (i % cols - 1) * gap;
+     const y = BOARD_H - offY - Math.floor(i / cols) * gap;
+     room.gameState.stones.push({
+       id: stoneId++, ownerIndex: 1, isCat: false,
+       x, y, vx: 0, vy: 0, radius: STONE_RADIUS
+     });
+   }
 
   // 플레이어들에게 시작 브로드캐스트
   room.players.forEach((p, idx) => {
@@ -132,11 +132,15 @@ function runSimulation(roomId) {
       }
     }
 
-    // 3) 원형 보드(중심/반경) 밖 제거 (예시)
-    room.gameState.stones = stones.filter(s => {
-      const dc = Math.hypot(s.x - CANVAS_SIZE / 2, s.y - CANVAS_SIZE / 2);
-      return dc < CANVAS_SIZE / 2;
-    });
+  // 3) 직사각형 보드 밖 제거 (반지름 여유 포함)
+  room.gameState.stones = stones.filter(s => {
+    return (
+      s.x >= -s.radius &&
+      s.x <= BOARD_W + s.radius &&
+      s.y >= -s.radius &&
+      s.y <= BOARD_H + s.radius
+    );
+  });
 
     // 4) 상태 방송
     io.to(roomId).emit('gameStateUpdate', room.gameState.stones);
@@ -214,6 +218,7 @@ io.on('connection', (socket) => {
 
     const stone = room.gameState.stones.find(s => s.id === stoneId);
     if (!stone) return;
+    if (stone.ownerIndex !== playerIndex) return;
 
     stone.vx = force.x;
     stone.vy = force.y;
