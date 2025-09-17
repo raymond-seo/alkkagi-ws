@@ -10,10 +10,139 @@ const cors = require('cors');
 
 const app = express();
 
-// Netlify 도메인만 허용 (필요하면 프리뷰 도메인 추가 가능)
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || 'https://mellow-parfait-132923.netlify.app';
+// === 세션 미들웨어 ===
+const cookieSession = require('cookie-session');
+const axios = require('axios');
+const crypto = require('crypto');
 
+app.set('trust proxy', 1);
+
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || 'https://mellow-parfait-132923.netlify.app';
 app.use(cors({ origin: [ALLOW_ORIGIN], credentials: true }));
+
+app.use(express.json());
+app.use(cookieSession({
+  name: 'sid',
+  secret: process.env.SESSION_SECRET,
+  httpOnly: true,
+  sameSite: 'none',
+  secure: true,
+  maxAge: 1000 * 60 * 60 * 24 * 7,
+}));
+
+// === 내 정보 ===
+app.get('/api/me', (req, res) => {
+  if (req.session?.user) {
+    return res.json(req.session.user); // { id, name }
+  }
+  return res.status(401).json({ error: 'NO_SESSION' });
+});
+
+// === 앱인토스: 인가코드 교환 → 이름 복호화 → 세션 저장 ===
+app.post('/api/toss/exchange', async (req, res) => {
+  try {
+    const { authorizationCode, referrer } = req.body || {};
+    if (!authorizationCode || !referrer) {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
+
+    // 1) 토큰 발급
+    const tokenResp = await axios.post(
+      'https://apps-in-toss-api.toss.im/api-partner/v1/apps-in-toss/user/oauth2/generate-token',
+      { authorizationCode, referrer },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    const tok = tokenResp.data?.success || tokenResp.data; // 가이드 포맷 맞춤
+    const accessToken = tok?.accessToken;
+    if (!accessToken) throw new Error('NO_ACCESS_TOKEN');
+
+    // 2) 유저 정보 조회 (암호화된 필드)
+    const meResp = await axios.get(
+      'https://apps-in-toss-api.toss.im/api-partner/v1/apps-in-toss/user/oauth2/login-me',
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const me = meResp.data?.success || meResp.data;
+    const userKey = me.userKey;
+    // 암호화된 이름 복호화
+    const nameEnc = me.name; // "ENCRYPTED_VALUE"
+    const name = nameEnc ? decryptTossField(nameEnc) : '토스유저';
+
+    // 세션 저장 (필요하면 accessToken/refreshToken도 넣어두면 재발급 가능)
+    req.session.user = { id: String(userKey || '0'), name };
+    return res.json(req.session.user);
+  } catch (e) {
+    console.error('toss exchange error:', e?.response?.data || e.message);
+    return res.status(500).json({ error: 'EXCHANGE_FAILED' });
+  }
+});
+
+// === AES-256-GCM 복호화 ===
+// 토스 가이드: 암호문(베이스64) 앞부분에 IV/Nonce 포함, AAD 제공
+function decryptTossField(b64) {
+  const keyB64 = process.env.TOSS_DECRYPTION_KEY_B64;
+  const aadStr = process.env.TOSS_AAD || 'TOSS';
+  if (!keyB64) throw new Error('NO_DECRYPTION_KEY');
+
+  const buf = Buffer.from(b64, 'base64');
+  const iv = buf.subarray(0, 12);                  // 일반적으로 GCM IV 12바이트
+  const tag = buf.subarray(buf.length - 16);       // GCM AuthTag 16바이트
+  const data = buf.subarray(12, buf.length - 16);  // 실제 암호문
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyB64, 'base64'), iv);
+  if (aadStr) decipher.setAAD(Buffer.from(aadStr, 'utf8'));
+  decipher.setAuthTag(tag);
+  const out = Buffer.concat([decipher.update(data), decipher.final()]);
+  return out.toString('utf8');
+}
+
+// === 추가: 결과 반영(서버 권위) ===
+// body: { win: boolean }
+app.post('/api/reportResult', (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ ok:false });
+  const id = req.session.user.id; // 세션의 id 사용
+  if (!global.__USERS__) global.__USERS__ = new Map();
+  const u = global.__USERS__.get(id) || { name:req.session.user.name, rating:1000, wins:0, losses:0 };
+
+  const win = !!req.body.win; // 전역 express.json()로 파싱됨
+  if (win) { u.wins++; u.rating += 15; }
+  else     { u.losses++; u.rating = Math.max(0, u.rating - 7); }
+
+  u.updatedAt = Date.now();
+  global.__USERS__.set(id, u);
+  res.json({ ok:true, rating:u.rating, wins:u.wins, losses:u.losses });
+});
+
+// === 추가: 리더보드/등급(상대평가) ===
+function tierByPercentile(pct){ // 0~100 (작을수록 상위)
+  if (pct <= 1)  return 'CHALLENGER';
+  if (pct <= 5)  return 'DIAMOND';
+  if (pct <= 15) return 'PLATINUM';
+  if (pct <= 35) return 'GOLD';
+  if (pct <= 65) return 'SILVER';
+  return 'BRONZE';
+}
+app.get('/api/leaderboard/me', (req, res) => {
+  if (!req.session?.user) return res.status(401).json({ ok:false });
+  if (!global.__USERS__) global.__USERS__ = new Map();
+
+  const id = req.session.user.id;
+
+  const users = Array.from(global.__USERS__.entries())
+    .map(([uid, u]) => ({ id: uid, ...u }))
+    .sort((a,b)=> b.rating - a.rating);
+
+  const total = users.length || 1;
+  const meIdx = users.findIndex(u => u.id === id);
+  const rank = (meIdx === -1 ? total : meIdx + 1);
+  const percentile = Math.round((rank - 1) / total * 100); // 0% = 1등
+  const tier = tierByPercentile(percentile);
+
+  res.json({ ok:true, rank, total, percentile, tier, snapshot: users.slice(0,50) });
+});
+
+
+// Netlify 도메인만 허용 (필요하면 프리뷰 도메인 추가 가능)
+
 app.get('/health', (req, res) => res.send('ok'));
 
 const server = http.createServer(app);
