@@ -28,8 +28,32 @@ const db = admin.firestore();
 
 app.set('trust proxy', 1);
 
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || 'https://mellow-parfait-132923.netlify.app';
-app.use(cors({ origin: [ALLOW_ORIGIN], credentials: true }));
+// ===== CORS (동적 화이트리스트) =====
+// Render 환경변수 예: ALLOW_ORIGINS="https://mellow-parfait-132923.netlify.app,https://my-prod.netlify.app,https://my-domain.com"
+const allowlist = (process.env.ALLOW_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function corsOrigin(origin, cb) {
+  // App WebView 등 Origin이 없는 경우 허용
+  if (!origin) return cb(null, true);
+  try {
+    const host = new URL(origin).hostname;
+    const ok =
+      allowlist.includes(origin) ||      // 정확히 매칭되는 도메인
+      host.endsWith('.netlify.app');     // Netlify 프리뷰/브랜치 도메인 모두 허용
+    cb(null, ok);
+  } catch {
+    cb(null, false);
+  }
+}
+
+app.use(cors({
+  origin: corsOrigin,
+  credentials: true
+}));
+
 
 app.use(express.json());
 app.use(cookieSession({
@@ -241,7 +265,11 @@ app.get('/health', (req, res) => res.send('ok'));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: [ALLOW_ORIGIN], methods: ['GET', 'POST'] }
+  cors: {
+    origin: corsOrigin,
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
 });
 
 // 게임 상수
