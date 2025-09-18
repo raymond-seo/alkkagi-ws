@@ -193,6 +193,48 @@ app.get('/api/leaderboard/me', async (req, res) => {
 });
 
 
+// --- Admin 보호 미들웨어 ---
+function requireAdmin(req, res, next) {
+  const token = req.get('x-admin-token') || req.query.token;
+  if (!token || token !== process.env.ADMIN_TOKEN) {
+    return res.status(403).json({ ok:false, error:'FORBIDDEN' });
+  }
+  next();
+}
+
+// 방 목록 조회
+app.get('/api/admin/rooms', requireAdmin, (req, res) => {
+  const list = Object.values(gameRooms).map(roomPublic);
+  res.json({ ok:true, rooms: list });
+});
+
+// 방 이름 변경
+app.patch('/api/admin/rooms/:id/rename', requireAdmin, express.json(), (req, res) => {
+  const id = req.params.id;
+  const room = gameRooms[id];
+  if (!room) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
+
+  const { clean, blocked } = sanitizeText(req.body?.name, room.name);
+  room.name = clean;
+  io.to(id).emit('updateRoom', roomPublic(room));
+  broadcastRooms();
+  res.json({ ok:true, name: room.name, wasBlocked: blocked });
+});
+
+// 방 강제 삭제 (내보내기 + 삭제)
+app.delete('/api/admin/rooms/:id', requireAdmin, (req, res) => {
+  const id = req.params.id;
+  const room = gameRooms[id];
+  if (!room) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
+
+  io.to(id).emit('errorMsg', '운영자에 의해 방이 종료되었습니다.');
+  io.socketsLeave(id);           // 모든 소켓을 방에서 빼기
+  delete gameRooms[id];
+  broadcastRooms();
+  res.json({ ok:true });
+});
+
+
 // Netlify 도메인만 허용 (필요하면 프리뷰 도메인 추가 가능)
 
 app.get('/health', (req, res) => res.send('ok'));
@@ -207,6 +249,33 @@ const BOARD_W = 360;
 const BOARD_H = 640;
 const STONE_RADIUS = 18;
 const FRICTION = 0.985;
+
+// --- Moderation utils (욕설/금칙어) ---
+const BAD_WORDS = [
+  'fuck','shit','bitch','asshole','dick','cunt',
+  '좆','씨발','시발','개새','개새끼','병신','ㅅㅂ','ㅈ같','꺼져','자지', '보지', 'ㅄ'
+];
+
+// 공통 정화: 공백/특수문자 처리 + 금칙어 * 마스킹
+function sanitizeText(raw, fallback='무제 방') {
+  const str = (raw || '').toString().trim().slice(0, 20);
+  if (!str) return { clean: fallback, blocked: false };
+
+  const lower = str.toLowerCase().replace(/\s+/g, '');
+  let blocked = false;
+  for (const w of BAD_WORDS) {
+    if (!w) continue;
+    const t = w.toLowerCase().replace(/\s+/g, '');
+    if (t && lower.includes(t)) { blocked = true; break; }
+  }
+
+  if (blocked) {
+    // 완전 차단 대신 마스킹하고 싶으면 여기서 처리
+    return { clean: fallback, blocked: true };
+  }
+  return { clean: str, blocked: false };
+}
+
 
 // --- 로비/방 목록용 유틸 ---
 const clients = new Map(); // socket.id -> { name }
@@ -366,6 +435,37 @@ function runSimulation(roomId) {
   }, 1000 / 60);
 }
 
+// 소켓이 어떤 방에 들어가 있든 정리 + 필요시 상대에게 gameOver
+function removeFromAnyRooms(socketId){
+  for (const roomId in gameRooms){
+    const room = gameRooms[roomId];
+    const idx = room.players.findIndex(p => p.id === socketId);
+    if (idx !== -1){
+      const oppIdx = 1 - idx;
+
+      // 게임 진행 중이었으면 남은 쪽 승리 처리
+      if (room.gameState && room.players[oppIdx]) {
+        io.to(room.players[oppIdx].id).emit('gameOver', oppIdx);
+      }
+
+      // 방에서 제거
+      room.players.splice(idx, 1);
+      io.socketsLeave(roomId);
+
+      // 방 비면 삭제, 아니면 상태 브로드캐스트
+      if (room.players.length === 0) {
+        delete gameRooms[roomId];
+      } else {
+        io.to(roomId).emit('updateRoom', roomPublic(room));
+      }
+      broadcastRooms();
+      // 한 방만 있을 수 있으니 바로 종료
+      return;
+    }
+  }
+}
+
+
 // ========================================================
 // 3. 소켓 이벤트
 // ========================================================
@@ -373,8 +473,8 @@ io.on('connection', (socket) => {
   console.log('[연결]', socket.id);
 
   socket.on('setName', (name) => {
-    const clean = (name || '').toString().trim().slice(0, 20) || '플레이어';
-    clients.set(socket.id, { name: clean });
+    const { clean, blocked } = sanitizeText(name, '플레이어');
+    clients.set(socket.id, { name: clean + (blocked ? '⚠️' : '') });
   });
 
   socket.on('listRooms', () => {
@@ -383,7 +483,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('createRoom', (payload = {}) => {
-    const roomName = (payload.name || '').toString().trim().slice(0, 20) || '무제 방';
+    removeFromAnyRooms(socket.id);
+    const { clean: roomName, blocked } = sanitizeText(payload.name, '무제 방');
+    if (blocked) return socket.emit('joinError', '부적절한 방 이름입니다.');
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
 
     socket.join(roomId);
@@ -402,6 +504,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('joinRoom', (roomId) => {
+    removeFromAnyRooms(socket.id);
     const room = gameRooms[roomId];
     if (!room) return socket.emit('joinError', '존재하지 않는 방입니다.');
     if (room.players.length >= 2) return socket.emit('joinError', '방이 꽉 찼습니다.');
@@ -461,22 +564,23 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    removeFromAnyRooms(socket.id);
     clients.delete(socket.id);
-    for (const roomId in gameRooms) {
-      const room = gameRooms[roomId];
-      const idx = room.players.findIndex(p => p.id === socket.id);
-      if (idx !== -1) {
-        const opp = 1 - idx;
-        if (room.players[opp]) {
-          io.to(room.players[opp].id).emit('gameOver', opp);
-        }
-        delete gameRooms[roomId];
-        break;
-      }
-    }
     broadcastRooms();
   });
 });
+
+setInterval(() => {
+  let changed = false;
+  for (const id in gameRooms){
+    const r = gameRooms[id];
+    if (!r.players || r.players.length === 0){
+      delete gameRooms[id];
+      changed = true;
+    }
+  }
+  if (changed) broadcastRooms();
+}, 60 * 1000);
 
 // ========================================================
 // 4. 서버 실행
